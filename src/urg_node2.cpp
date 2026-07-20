@@ -14,6 +14,17 @@
 
 #include "urg_node2/urg_node2.hpp"
 
+#include <linux/gpio.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/select.h>
+#include <cstring>
+
+#ifndef GPIO_V2_LINE_FLAG_EVENT_CLOCK_HTE
+#define GPIO_V2_LINE_FLAG_EVENT_CLOCK_HTE (1ULL << 12)
+#endif
+
 namespace urg_node2
 {
 
@@ -28,7 +39,10 @@ UrgNode2::UrgNode2(const rclcpp::NodeOptions & node_options)
   system_latency_(0ns),
   user_latency_(0ns),
   first_step_(0),
-  last_step_(0)
+  last_step_(0),
+  hte_fd_(-1),
+  hte_timestamp_ns_(0),
+  close_hte_thread_(false)
 {
   // urg_open後にLiDARの電源がOFFになった状態でLiDARと通信しようとするとSIGPIPEシグナルが発生する
   // ROS1ではROSのライブラリで設定されていたがROS2では未対応のため、ここで設定する
@@ -53,6 +67,9 @@ UrgNode2::UrgNode2(const rclcpp::NodeOptions & node_options)
   angle_max_ = declare_parameter<double>("angle_max", M_PI);
   skip_ = declare_parameter<int>("skip", 0);
   cluster_ = declare_parameter<int>("cluster", 1);
+  use_hte_ = declare_parameter<bool>("use_hte", false);
+  hte_gpio_chip_ = declare_parameter<std::string>("hte_gpio_chip", "/dev/gpiochip1");
+  hte_gpio_offset_ = declare_parameter<int>("hte_gpio_offset", 0);
 }
 
 // デストラクタ
@@ -60,6 +77,7 @@ UrgNode2::~UrgNode2()
 {
   // スレッドの停止
   stop_thread();
+  stop_hte_thread();
 }
 
 // onConfigure
@@ -82,6 +100,10 @@ UrgNode2::CallbackReturn UrgNode2::on_configure(const rclcpp_lifecycle::State & 
 
   // スレッド起動
   start_thread();
+
+  if (use_hte_ && init_hte_gpio()) {
+    start_hte_thread();
+  }
 
   return CallbackReturn::SUCCESS;
 }
@@ -131,6 +153,7 @@ UrgNode2::CallbackReturn UrgNode2::on_cleanup(const rclcpp_lifecycle::State & st
 
   // スレッドの停止
   stop_thread();
+  stop_hte_thread();
 
   // publisherの解放
   if (use_multiecho_) {
@@ -152,6 +175,7 @@ UrgNode2::CallbackReturn UrgNode2::on_shutdown(const rclcpp_lifecycle::State & s
 
   // スレッドの停止
   stop_thread();
+  stop_hte_thread();
 
   // Diagnostics停止
   stop_diagnostics();
@@ -176,6 +200,7 @@ UrgNode2::CallbackReturn UrgNode2::on_error(const rclcpp_lifecycle::State & stat
 
   // スレッドの停止
   stop_thread();
+  stop_hte_thread();
 
   // Diagnostics停止
   stop_diagnostics();
@@ -215,6 +240,9 @@ void UrgNode2::initialize()
   angle_max_ = get_parameter("angle_max").as_double();
   skip_ = get_parameter("skip").as_int();
   cluster_ = get_parameter("cluster").as_int();
+  use_hte_ = get_parameter("use_hte").as_bool();
+  hte_gpio_chip_ = get_parameter("hte_gpio_chip").as_string();
+  hte_gpio_offset_ = get_parameter("hte_gpio_offset").as_int();
 
   // 範囲チェック
   angle_min_ = (angle_min_ < -M_PI) ? -M_PI : ((angle_min_ > M_PI) ? M_PI : angle_min_);
@@ -556,11 +584,15 @@ bool UrgNode2::create_scan_message(sensor_msgs::msg::LaserScan & msg)
   }
 
   // タイムスタンプ設定
-  if (synchronize_time_) {
-    system_time_stamp = get_synchronized_time(time_stamp, system_time_stamp);
+  if (use_hte_ && hte_timestamp_ns_.load(std::memory_order_relaxed) > 0) {
+    msg.header.stamp = rclcpp::Time(static_cast<int64_t>(hte_timestamp_ns_.load(std::memory_order_relaxed)), RCL_SYSTEM_TIME);
+  } else {
+    if (synchronize_time_) {
+      system_time_stamp = get_synchronized_time(time_stamp, system_time_stamp);
+    }
+    msg.header.stamp = system_time_stamp + system_latency_ + user_latency_ +
+      get_angular_time_offset();
   }
-  msg.header.stamp = system_time_stamp + system_latency_ + user_latency_ +
-    get_angular_time_offset();
 
   // データ領域確保
   msg.ranges.resize(num_beams);
@@ -609,11 +641,15 @@ bool UrgNode2::create_scan_message(sensor_msgs::msg::MultiEchoLaserScan & msg)
   }
 
   // タイムスタンプ設定
-  if (synchronize_time_) {
-    system_time_stamp = get_synchronized_time(time_stamp, system_time_stamp);
+  if (use_hte_ && hte_timestamp_ns_.load(std::memory_order_relaxed) > 0) {
+    msg.header.stamp = rclcpp::Time(static_cast<int64_t>(hte_timestamp_ns_.load(std::memory_order_relaxed)), RCL_SYSTEM_TIME);
+  } else {
+    if (synchronize_time_) {
+      system_time_stamp = get_synchronized_time(time_stamp, system_time_stamp);
+    }
+    msg.header.stamp = system_time_stamp + system_latency_ + user_latency_ +
+      get_angular_time_offset();
   }
-  msg.header.stamp = system_time_stamp + system_latency_ + user_latency_ +
-    get_angular_time_offset();
 
   // データ領域確保
   msg.ranges.reserve(num_beams);
@@ -711,6 +747,84 @@ void UrgNode2::stop_thread(void)
   close_thread_ = true;
   if (scan_thread_.joinable()) {
     scan_thread_.join();
+  }
+}
+
+// HTE用GPIOの初期化
+bool UrgNode2::init_hte_gpio(void)
+{
+  if (!use_hte_) {
+    return true;
+  }
+
+  int chip_fd = open(hte_gpio_chip_.c_str(), O_RDWR);
+  if (chip_fd < 0) {
+    RCLCPP_WARN(get_logger(), "Failed to open GPIO chip %s for HTE", hte_gpio_chip_.c_str());
+    return false;
+  }
+
+  struct gpio_v2_line_request req;
+  memset(&req, 0, sizeof(req));
+  req.offsets[0] = hte_gpio_offset_;
+  req.num_lines = 1;
+  req.config.flags = GPIO_V2_LINE_FLAG_INPUT | GPIO_V2_LINE_FLAG_EDGE_RISING | GPIO_V2_LINE_FLAG_EVENT_CLOCK_HTE;
+  strncpy(req.consumer, "urg_node2_hte", sizeof(req.consumer) - 1);
+
+  if (ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &req) < 0) {
+    RCLCPP_WARN(get_logger(), "Failed to request GPIO line for HTE. HTE might not be supported on %s pin %d", hte_gpio_chip_.c_str(), hte_gpio_offset_);
+    close(chip_fd);
+    return false;
+  }
+
+  // The requested line fd is returned in req.fd
+  hte_fd_ = req.fd;
+  
+  // We can close the chip fd, as the line fd is independent
+  close(chip_fd);
+
+  RCLCPP_INFO(get_logger(), "Successfully initialized HTE on %s pin %d", hte_gpio_chip_.c_str(), hte_gpio_offset_);
+  return true;
+}
+
+// HTEスレッドの開始
+void UrgNode2::start_hte_thread(void)
+{
+  if (hte_fd_ >= 0) {
+    close_hte_thread_ = false;
+    hte_thread_ = std::thread(std::bind(&UrgNode2::hte_worker, this));
+  }
+}
+
+// HTEスレッドの停止
+void UrgNode2::stop_hte_thread(void)
+{
+  close_hte_thread_ = true;
+  if (hte_thread_.joinable()) {
+    hte_thread_.join();
+  }
+  if (hte_fd_ >= 0) {
+    close(hte_fd_);
+    hte_fd_ = -1;
+  }
+}
+
+// HTEスレッド
+void UrgNode2::hte_worker(void)
+{
+  struct gpio_v2_line_event event;
+  while (!close_hte_thread_) {
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(hte_fd_, &set);
+    
+    struct timeval timeout = {0, 100000}; // 100ms timeout
+    int ret = select(hte_fd_ + 1, &set, NULL, NULL, &timeout);
+    
+    if (ret > 0 && FD_ISSET(hte_fd_, &set)) {
+      if (read(hte_fd_, &event, sizeof(event)) == sizeof(event)) {
+        hte_timestamp_ns_.store(event.timestamp_ns, std::memory_order_relaxed);
+      }
+    }
   }
 }
 

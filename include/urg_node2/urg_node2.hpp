@@ -32,6 +32,7 @@
 #include <functional>
 #include <limits>
 #include <csignal>
+#include <atomic>
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
@@ -269,6 +270,28 @@ private:
    */
   void stop_diagnostics(void);
 
+  /**
+   * @brief HTE用GPIOの初期化
+   * @retval true 成功
+   * @retval false 失敗
+   */
+  bool init_hte_gpio(void);
+
+  /**
+   * @brief HTEスレッドの開始
+   */
+  void start_hte_thread(void);
+
+  /**
+   * @brief HTEスレッドの停止
+   */
+  void stop_hte_thread(void);
+
+  /**
+   * @brief HTEスレッド
+   */
+  void hte_worker(void);
+
   /** スキャンデータのpublisher */
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::LaserScan>> scan_pub_;
   /** マルチエコースキャンデータのpublisher */
@@ -325,6 +348,13 @@ private:
   int skip_;
   /** パラメータ"cluster" : グルーピング設定 */
   int cluster_;
+
+  /** パラメータ"use_hte" : HTEハードウェアタイムスタンプを使用するかどうか */
+  bool use_hte_;
+  /** パラメータ"hte_gpio_chip" : HTE用GPIOチップパス */
+  std::string hte_gpio_chip_;
+  /** パラメータ"hte_gpio_offset" : HTE用GPIOオフセット */
+  int hte_gpio_offset_;
 
   /** デバイス状態 : urg_sensor_status()の値を格納 */
   std::string device_status_;
@@ -403,6 +433,15 @@ private:
   double topic_range_min_;
   /** トピック設定用range_max */
   double topic_range_max_;
+
+  /** HTE GPIOファイルディスクリプタ */
+  int hte_fd_;
+  /** HTE最新タイムスタンプ[ns] */
+  std::atomic<uint64_t> hte_timestamp_ns_;
+  /** HTEスレッドの終了フラグ */
+  std::atomic<bool> close_hte_thread_;
+  /** HTEスレッドのスレッド変数 */
+  std::thread hte_thread_;
 };
 
 }
