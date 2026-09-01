@@ -33,6 +33,8 @@
 #include <limits>
 #include <csignal>
 #include <atomic>
+#include <deque>
+#include <mutex>
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
@@ -271,26 +273,32 @@ private:
   void stop_diagnostics(void);
 
   /**
-   * @brief HTE用GPIOの初期化
+   * @brief GPIO割り込みタイムスタンプの初期化
    * @retval true 成功
    * @retval false 失敗
    */
-  bool init_hte_gpio(void);
+  bool init_gpio_timestamp(void);
 
   /**
-   * @brief HTEスレッドの開始
+   * @brief GPIOスレッドの開始
    */
-  void start_hte_thread(void);
+  void start_gpio_thread(void);
 
   /**
-   * @brief HTEスレッドの停止
+   * @brief GPIOスレッドの停止
    */
-  void stop_hte_thread(void);
+  void stop_gpio_thread(void);
 
   /**
-   * @brief HTEスレッド
+   * @brief GPIOスレッド
    */
-  void hte_worker(void);
+  void gpio_worker(void);
+
+  /**
+   * @brief 最寄りのパルスタイムスタンプ検索
+   */
+  bool get_matching_pulse_timestamp(uint64_t approx_scan_start_ns, uint64_t & matched_pulse_ns);
+
 
   /** スキャンデータのpublisher */
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::LaserScan>> scan_pub_;
@@ -349,12 +357,6 @@ private:
   /** パラメータ"cluster" : グルーピング設定 */
   int cluster_;
 
-  /** パラメータ"use_hte" : HTEハードウェアタイムスタンプを使用するかどうか */
-  bool use_hte_;
-  /** パラメータ"hte_gpio_chip" : HTE用GPIOチップパス */
-  std::string hte_gpio_chip_;
-  /** パラメータ"hte_gpio_offset" : HTE用GPIOオフセット */
-  int hte_gpio_offset_;
 
   /** デバイス状態 : urg_sensor_status()の値を格納 */
   std::string device_status_;
@@ -434,14 +436,38 @@ private:
   /** トピック設定用range_max */
   double topic_range_max_;
 
-  /** HTE GPIOファイルディスクリプタ */
-  int hte_fd_;
-  /** HTE最新タイムスタンプ[ns] */
-  std::atomic<uint64_t> hte_timestamp_ns_;
-  /** HTEスレッドの終了フラグ */
-  std::atomic<bool> close_hte_thread_;
-  /** HTEスレッドのスレッド変数 */
-  std::thread hte_thread_;
+  /** パラメータ"use_gpio_timestamp" : GPIO割り込みタイムスタンプを使用するかどうか */
+  bool use_gpio_timestamp_;
+  /** パラメータ"gpio_chip" : GPIOチップパス */
+  std::string gpio_chip_;
+  /** パラメータ"gpio_offset" : GPIOオフセット */
+  int gpio_offset_;
+  /** パラメータ"gpio_bias" : GPIOバイアス (pull_up, pull_down, disable/none) */
+  std::string gpio_bias_;
+
+  /** GPIOファイルディスクリプタ */
+  int gpio_fd_;
+  /** GPIO最新タイムスタンプ[ns] */
+  std::atomic<uint64_t> gpio_timestamp_ns_;
+  /** GPIOパルスライムスタンプキュー */
+  std::deque<uint64_t> pulse_queue_;
+  std::mutex pulse_queue_mutex_;
+  static constexpr size_t MAX_PULSE_QUEUE_SIZE = 20;
+
+  /** GPIOスレッドの終了フラグ */
+  std::atomic<bool> close_gpio_thread_;
+  /** GPIOスレッドのスレッド変数 */
+  std::thread gpio_thread_;
+
+  /** タイムスタンプ取得ソース */
+  enum class TimestampSource {
+    NONE,
+    PIN,
+    NETWORK
+  };
+  TimestampSource last_timestamp_source_;
+  void update_timestamp_source_log(bool is_using_pin);
+
 };
 
 }

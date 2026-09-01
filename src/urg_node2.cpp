@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "urg_node2/urg_node2.hpp"
-
 #include <linux/gpio.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
@@ -21,9 +19,12 @@
 #include <sys/select.h>
 #include <cstring>
 
-#ifndef GPIO_V2_LINE_FLAG_EVENT_CLOCK_HTE
-#define GPIO_V2_LINE_FLAG_EVENT_CLOCK_HTE (1ULL << 12)
+#ifndef GPIO_V2_LINE_FLAG_EVENT_CLOCK_REALTIME
+#define GPIO_V2_LINE_FLAG_EVENT_CLOCK_REALTIME (1ULL << 11)
 #endif
+
+
+#include "urg_node2/urg_node2.hpp"
 
 namespace urg_node2
 {
@@ -40,9 +41,10 @@ UrgNode2::UrgNode2(const rclcpp::NodeOptions & node_options)
   user_latency_(0ns),
   first_step_(0),
   last_step_(0),
-  hte_fd_(-1),
-  hte_timestamp_ns_(0),
-  close_hte_thread_(false)
+  gpio_fd_(-1),
+  gpio_timestamp_ns_(0),
+  close_gpio_thread_(false),
+  last_timestamp_source_(TimestampSource::NONE)
 {
   // urg_open後にLiDARの電源がOFFになった状態でLiDARと通信しようとするとSIGPIPEシグナルが発生する
   // ROS1ではROSのライブラリで設定されていたがROS2では未対応のため、ここで設定する
@@ -67,9 +69,11 @@ UrgNode2::UrgNode2(const rclcpp::NodeOptions & node_options)
   angle_max_ = declare_parameter<double>("angle_max", M_PI);
   skip_ = declare_parameter<int>("skip", 0);
   cluster_ = declare_parameter<int>("cluster", 1);
-  use_hte_ = declare_parameter<bool>("use_hte", false);
-  hte_gpio_chip_ = declare_parameter<std::string>("hte_gpio_chip", "/dev/gpiochip1");
-  hte_gpio_offset_ = declare_parameter<int>("hte_gpio_offset", 0);
+  use_gpio_timestamp_ = declare_parameter<bool>("use_gpio_timestamp", false);
+  gpio_chip_ = declare_parameter<std::string>("gpio_chip", "/dev/gpiochip0");
+  gpio_offset_ = declare_parameter<int>("gpio_offset", 126);
+  gpio_bias_ = declare_parameter<std::string>("gpio_bias", "pull_up");
+
 }
 
 // デストラクタ
@@ -77,7 +81,7 @@ UrgNode2::~UrgNode2()
 {
   // スレッドの停止
   stop_thread();
-  stop_hte_thread();
+  stop_gpio_thread();
 }
 
 // onConfigure
@@ -101,8 +105,8 @@ UrgNode2::CallbackReturn UrgNode2::on_configure(const rclcpp_lifecycle::State & 
   // スレッド起動
   start_thread();
 
-  if (use_hte_ && init_hte_gpio()) {
-    start_hte_thread();
+  if (use_gpio_timestamp_ && init_gpio_timestamp()) {
+    start_gpio_thread();
   }
 
   return CallbackReturn::SUCCESS;
@@ -153,7 +157,7 @@ UrgNode2::CallbackReturn UrgNode2::on_cleanup(const rclcpp_lifecycle::State & st
 
   // スレッドの停止
   stop_thread();
-  stop_hte_thread();
+  stop_gpio_thread();
 
   // publisherの解放
   if (use_multiecho_) {
@@ -175,7 +179,7 @@ UrgNode2::CallbackReturn UrgNode2::on_shutdown(const rclcpp_lifecycle::State & s
 
   // スレッドの停止
   stop_thread();
-  stop_hte_thread();
+  stop_gpio_thread();
 
   // Diagnostics停止
   stop_diagnostics();
@@ -200,7 +204,7 @@ UrgNode2::CallbackReturn UrgNode2::on_error(const rclcpp_lifecycle::State & stat
 
   // スレッドの停止
   stop_thread();
-  stop_hte_thread();
+  stop_gpio_thread();
 
   // Diagnostics停止
   stop_diagnostics();
@@ -240,9 +244,11 @@ void UrgNode2::initialize()
   angle_max_ = get_parameter("angle_max").as_double();
   skip_ = get_parameter("skip").as_int();
   cluster_ = get_parameter("cluster").as_int();
-  use_hte_ = get_parameter("use_hte").as_bool();
-  hte_gpio_chip_ = get_parameter("hte_gpio_chip").as_string();
-  hte_gpio_offset_ = get_parameter("hte_gpio_offset").as_int();
+  use_gpio_timestamp_ = get_parameter("use_gpio_timestamp").as_bool();
+  gpio_chip_ = get_parameter("gpio_chip").as_string();
+  gpio_offset_ = get_parameter("gpio_offset").as_int();
+  gpio_bias_ = get_parameter("gpio_bias").as_string();
+
 
   // 範囲チェック
   angle_min_ = (angle_min_ < -M_PI) ? -M_PI : ((angle_min_ > M_PI) ? M_PI : angle_min_);
@@ -266,6 +272,7 @@ void UrgNode2::initialize()
   last_hardware_time_stamp_ = 0;
   hardware_clock_adj_ = 0;
   adj_count_ = 0;
+  last_timestamp_source_ = TimestampSource::NONE;
 }
 
 // Lidarとの接続処理
@@ -584,8 +591,16 @@ bool UrgNode2::create_scan_message(sensor_msgs::msg::LaserScan & msg)
   }
 
   // タイムスタンプ設定
-  if (use_hte_ && hte_timestamp_ns_.load(std::memory_order_relaxed) > 0) {
-    msg.header.stamp = rclcpp::Time(static_cast<int64_t>(hte_timestamp_ns_.load(std::memory_order_relaxed)), RCL_SYSTEM_TIME);
+  uint64_t now_ns = static_cast<uint64_t>(system_time_stamp.nanoseconds());
+  uint64_t approx_scan_start_ns = (now_ns > static_cast<uint64_t>(scan_period_ * 1e9)) ?
+    (now_ns - static_cast<uint64_t>(scan_period_ * 1e9)) : now_ns;
+
+  uint64_t matched_pulse_ns = 0;
+  bool is_using_pin = use_gpio_timestamp_ && get_matching_pulse_timestamp(approx_scan_start_ns, matched_pulse_ns);
+  update_timestamp_source_log(is_using_pin);
+
+  if (is_using_pin) {
+    msg.header.stamp = rclcpp::Time(static_cast<int64_t>(matched_pulse_ns), RCL_SYSTEM_TIME);
   } else {
     if (synchronize_time_) {
       system_time_stamp = get_synchronized_time(time_stamp, system_time_stamp);
@@ -641,8 +656,16 @@ bool UrgNode2::create_scan_message(sensor_msgs::msg::MultiEchoLaserScan & msg)
   }
 
   // タイムスタンプ設定
-  if (use_hte_ && hte_timestamp_ns_.load(std::memory_order_relaxed) > 0) {
-    msg.header.stamp = rclcpp::Time(static_cast<int64_t>(hte_timestamp_ns_.load(std::memory_order_relaxed)), RCL_SYSTEM_TIME);
+  uint64_t now_ns = static_cast<uint64_t>(system_time_stamp.nanoseconds());
+  uint64_t approx_scan_start_ns = (now_ns > static_cast<uint64_t>(scan_period_ * 1e9)) ?
+    (now_ns - static_cast<uint64_t>(scan_period_ * 1e9)) : now_ns;
+
+  uint64_t matched_pulse_ns = 0;
+  bool is_using_pin = use_gpio_timestamp_ && get_matching_pulse_timestamp(approx_scan_start_ns, matched_pulse_ns);
+  update_timestamp_source_log(is_using_pin);
+
+  if (is_using_pin) {
+    msg.header.stamp = rclcpp::Time(static_cast<int64_t>(matched_pulse_ns), RCL_SYSTEM_TIME);
   } else {
     if (synchronize_time_) {
       system_time_stamp = get_synchronized_time(time_stamp, system_time_stamp);
@@ -750,83 +773,7 @@ void UrgNode2::stop_thread(void)
   }
 }
 
-// HTE用GPIOの初期化
-bool UrgNode2::init_hte_gpio(void)
-{
-  if (!use_hte_) {
-    return true;
-  }
 
-  int chip_fd = open(hte_gpio_chip_.c_str(), O_RDWR);
-  if (chip_fd < 0) {
-    RCLCPP_WARN(get_logger(), "Failed to open GPIO chip %s for HTE", hte_gpio_chip_.c_str());
-    return false;
-  }
-
-  struct gpio_v2_line_request req;
-  memset(&req, 0, sizeof(req));
-  req.offsets[0] = hte_gpio_offset_;
-  req.num_lines = 1;
-  req.config.flags = GPIO_V2_LINE_FLAG_INPUT | GPIO_V2_LINE_FLAG_EDGE_RISING | GPIO_V2_LINE_FLAG_EVENT_CLOCK_HTE;
-  strncpy(req.consumer, "urg_node2_hte", sizeof(req.consumer) - 1);
-
-  if (ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &req) < 0) {
-    RCLCPP_WARN(get_logger(), "Failed to request GPIO line for HTE. HTE might not be supported on %s pin %d", hte_gpio_chip_.c_str(), hte_gpio_offset_);
-    close(chip_fd);
-    return false;
-  }
-
-  // The requested line fd is returned in req.fd
-  hte_fd_ = req.fd;
-  
-  // We can close the chip fd, as the line fd is independent
-  close(chip_fd);
-
-  RCLCPP_INFO(get_logger(), "Successfully initialized HTE on %s pin %d", hte_gpio_chip_.c_str(), hte_gpio_offset_);
-  return true;
-}
-
-// HTEスレッドの開始
-void UrgNode2::start_hte_thread(void)
-{
-  if (hte_fd_ >= 0) {
-    close_hte_thread_ = false;
-    hte_thread_ = std::thread(std::bind(&UrgNode2::hte_worker, this));
-  }
-}
-
-// HTEスレッドの停止
-void UrgNode2::stop_hte_thread(void)
-{
-  close_hte_thread_ = true;
-  if (hte_thread_.joinable()) {
-    hte_thread_.join();
-  }
-  if (hte_fd_ >= 0) {
-    close(hte_fd_);
-    hte_fd_ = -1;
-  }
-}
-
-// HTEスレッド
-void UrgNode2::hte_worker(void)
-{
-  struct gpio_v2_line_event event;
-  while (!close_hte_thread_) {
-    fd_set set;
-    FD_ZERO(&set);
-    FD_SET(hte_fd_, &set);
-    
-    struct timeval timeout = {0, 100000}; // 100ms timeout
-    int ret = select(hte_fd_ + 1, &set, NULL, NULL, &timeout);
-    
-    if (ret > 0 && FD_ISSET(hte_fd_, &set)) {
-      if (read(hte_fd_, &event, sizeof(event)) == sizeof(event)) {
-        hte_timestamp_ns_.store(event.timestamp_ns, std::memory_order_relaxed);
-      }
-    }
-  }
-}
 
 // Diagnosticsの開始
 void UrgNode2::start_diagnostics(void)
@@ -1135,7 +1082,138 @@ rclcpp::Duration UrgNode2::get_angular_time_offset(void)
   return rclcpp::Duration::from_seconds(circle_fraction * scan_period_);
 }
 
+bool UrgNode2::init_gpio_timestamp(void)
+{
+  if (!use_gpio_timestamp_) {
+    return true;
+  }
+
+  int chip_fd = open(gpio_chip_.c_str(), O_RDWR);
+  if (chip_fd < 0) {
+    RCLCPP_WARN(get_logger(), "Failed to open GPIO chip %s", gpio_chip_.c_str());
+    return false;
+  }
+
+  struct gpio_v2_line_request req;
+  memset(&req, 0, sizeof(req));
+  req.offsets[0] = gpio_offset_;
+  req.num_lines = 1;
+  req.config.flags = GPIO_V2_LINE_FLAG_INPUT | GPIO_V2_LINE_FLAG_EDGE_RISING | GPIO_V2_LINE_FLAG_EVENT_CLOCK_REALTIME;
+  if (gpio_bias_ == "pull_up") {
+    req.config.flags |= GPIO_V2_LINE_FLAG_BIAS_PULL_UP;
+  } else if (gpio_bias_ == "pull_down") {
+    req.config.flags |= GPIO_V2_LINE_FLAG_BIAS_PULL_DOWN;
+  } else if (gpio_bias_ == "disable" || gpio_bias_ == "none") {
+    req.config.flags |= GPIO_V2_LINE_FLAG_BIAS_DISABLED;
+  }
+  strncpy(req.consumer, "urg_node2_gpio", sizeof(req.consumer) - 1);
+
+  if (ioctl(chip_fd, GPIO_V2_GET_LINE_IOCTL, &req) < 0) {
+    RCLCPP_WARN(get_logger(), "Failed to request GPIO line for timestamping on %s pin %d", gpio_chip_.c_str(), gpio_offset_);
+    close(chip_fd);
+    return false;
+  }
+
+  gpio_fd_ = req.fd;
+  close(chip_fd);
+
+  RCLCPP_INFO(get_logger(), "Successfully initialized Kernel GPIO IRQ Timestamping (CLOCK_REALTIME) on %s pin %d", gpio_chip_.c_str(), gpio_offset_);
+  return true;
 }
+
+void UrgNode2::start_gpio_thread(void)
+{
+  if (gpio_fd_ >= 0) {
+    close_gpio_thread_ = false;
+    gpio_thread_ = std::thread(std::bind(&UrgNode2::gpio_worker, this));
+  }
+}
+
+void UrgNode2::stop_gpio_thread(void)
+{
+  close_gpio_thread_ = true;
+  if (gpio_thread_.joinable()) {
+    gpio_thread_.join();
+  }
+  if (gpio_fd_ >= 0) {
+    close(gpio_fd_);
+    gpio_fd_ = -1;
+  }
+}
+
+void UrgNode2::gpio_worker(void)
+{
+  struct gpio_v2_line_event event;
+  while (!close_gpio_thread_) {
+    fd_set set;
+    FD_ZERO(&set);
+    FD_SET(gpio_fd_, &set);
+    
+    struct timeval timeout = {0, 100000}; // 100ms timeout
+    int ret = select(gpio_fd_ + 1, &set, NULL, NULL, &timeout);
+    
+    if (ret > 0 && FD_ISSET(gpio_fd_, &set)) {
+      if (read(gpio_fd_, &event, sizeof(event)) == sizeof(event)) {
+        gpio_timestamp_ns_.store(event.timestamp_ns, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(pulse_queue_mutex_);
+        pulse_queue_.push_back(event.timestamp_ns);
+        if (pulse_queue_.size() > MAX_PULSE_QUEUE_SIZE) {
+          pulse_queue_.pop_front();
+        }
+      }
+    }
+  }
+}
+
+bool UrgNode2::get_matching_pulse_timestamp(uint64_t approx_scan_start_ns, uint64_t & matched_pulse_ns)
+{
+  std::lock_guard<std::mutex> lock(pulse_queue_mutex_);
+  if (pulse_queue_.empty()) {
+    return false;
+  }
+
+  double max_diff_ns = 0.5 * scan_period_ * 1e9;
+  if (max_diff_ns < 15e6) {
+    max_diff_ns = 15e6;
+  }
+
+  auto best_it = pulse_queue_.end();
+  double best_diff = max_diff_ns + 1.0;
+
+  for (auto it = pulse_queue_.begin(); it != pulse_queue_.end(); ++it) {
+    double diff = std::abs(static_cast<double>(*it) - static_cast<double>(approx_scan_start_ns));
+    if (diff < best_diff) {
+      best_diff = diff;
+      best_it = it;
+    }
+  }
+
+  if (best_it != pulse_queue_.end() && best_diff <= max_diff_ns) {
+    matched_pulse_ns = *best_it;
+    pulse_queue_.erase(pulse_queue_.begin(), best_it + 1);
+    return true;
+  }
+
+  return false;
+}
+
+void UrgNode2::update_timestamp_source_log(bool is_using_pin)
+{
+  TimestampSource current_source = is_using_pin ? TimestampSource::PIN : TimestampSource::NETWORK;
+  if (current_source != last_timestamp_source_) {
+    last_timestamp_source_ = current_source;
+    if (current_source == TimestampSource::PIN) {
+      RCLCPP_INFO(
+        get_logger(), "Getting timestamp from PIN (Kernel GPIO IRQ Timestamping on %s pin %d)",
+        gpio_chip_.c_str(), gpio_offset_);
+    } else {
+      RCLCPP_INFO(get_logger(), "Getting timestamp from NETWORK (System / Network time)");
+    }
+  }
+}
+
+}  // namespace urg_node2
 
 #include "rclcpp_components/register_node_macro.hpp"
 RCLCPP_COMPONENTS_REGISTER_NODE(urg_node2::UrgNode2)
+

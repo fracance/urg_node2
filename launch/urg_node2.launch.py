@@ -46,7 +46,12 @@ def generate_launch_description():
         executable='urg_node2_node',
         name=LaunchConfiguration('node_name'),
         remappings=[('scan', LaunchConfiguration('scan_topic_name'))],
-        parameters=[config_params],
+        parameters=[config_params, {
+            'use_gpio_timestamp': LaunchConfiguration('use_gpio_timestamp'),
+            'gpio_chip': LaunchConfiguration('gpio_chip'),
+            'gpio_offset': LaunchConfiguration('gpio_offset'),
+            'gpio_bias': LaunchConfiguration('gpio_bias'),
+        }],
         namespace='',
         output='screen',
     )
@@ -86,13 +91,21 @@ def generate_launch_description():
     )
 
     # パラメータについて
-    # auto_start      : 起動時自動でActive状態まで遷移 (default)true
-    # node_name       : ノード名 (default)"urg_node2"
-    # scan_topic_name : トピック名 (default)"scan" *マルチエコー非対応*
+    # auto_start         : 起動時自動でActive状態まで遷移 (default)true
+    # node_name          : ノード名 (default)"urg_node2"
+    # scan_topic_name    : トピック名 (default)"scan" *マルチエコー非対応*
+    # use_gpio_timestamp : GPIO割り込みタイムスタンプを使用するかどうか (default)true
+    # gpio_chip          : GPIOチップパス (default)"/dev/gpiochip0"
+    # gpio_offset        : GPIOピンオフセット (default)126 (Pin 16)
+    # gpio_bias          : GPIOバイアス (default)"pull_up"
     return LaunchDescription([
         DeclareLaunchArgument('auto_start', default_value='true'),
         DeclareLaunchArgument('node_name', default_value='urg_node2'),
         DeclareLaunchArgument('scan_topic_name', default_value='scan'),
+        DeclareLaunchArgument('use_gpio_timestamp', default_value='true'),
+        DeclareLaunchArgument('gpio_chip', default_value='/dev/gpiochip0'),
+        DeclareLaunchArgument('gpio_offset', default_value='126'),
+        DeclareLaunchArgument('gpio_bias', default_value='pull_up'),
         lifecycle_node,
         urg_node2_node_configure_event_handler,
         urg_node2_node_activate_event_handler,
