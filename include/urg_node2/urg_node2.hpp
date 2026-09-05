@@ -299,6 +299,14 @@ private:
    */
   bool get_matching_pulse_timestamp(uint64_t approx_scan_start_ns, uint64_t & matched_pulse_ns);
 
+  /**
+   * @brief ヘッダスタンプの単調増加を保証する（クランプ）
+   * @details stampが直前に発行したスタンプ以下の場合、直前スタンプ+1usに補正する
+   * @param[in] stamp_in 発行予定のヘッダスタンプ
+   * @return 単調性を保証したヘッダスタンプ
+   */
+  rclcpp::Time clamp_monotonic_stamp(const rclcpp::Time & stamp_in);
+
 
   /** スキャンデータのpublisher */
   std::shared_ptr<rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::LaserScan>> scan_pub_;
@@ -467,6 +475,9 @@ private:
   };
   TimestampSource last_timestamp_source_;
   void update_timestamp_source_log(bool is_using_pin);
+
+  /** 直前に発行したヘッダスタンプ（単調性保証用） */
+  rclcpp::Time last_stamp_;
 
 };
 
