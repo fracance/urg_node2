@@ -44,7 +44,8 @@ UrgNode2::UrgNode2(const rclcpp::NodeOptions & node_options)
   gpio_fd_(-1),
   gpio_timestamp_ns_(0),
   close_gpio_thread_(false),
-  last_timestamp_source_(TimestampSource::NONE)
+  last_timestamp_source_(TimestampSource::NONE),
+  last_stamp_(0, 0, RCL_SYSTEM_TIME)
 {
   // urg_open後にLiDARの電源がOFFになった状態でLiDARと通信しようとするとSIGPIPEシグナルが発生する
   // ROS1ではROSのライブラリで設定されていたがROS2では未対応のため、ここで設定する
@@ -592,8 +593,13 @@ bool UrgNode2::create_scan_message(sensor_msgs::msg::LaserScan & msg)
 
   // タイムスタンプ設定
   uint64_t now_ns = static_cast<uint64_t>(system_time_stamp.nanoseconds());
-  uint64_t approx_scan_start_ns = (now_ns > static_cast<uint64_t>(scan_period_ * 1e9)) ?
-    (now_ns - static_cast<uint64_t>(scan_period_ * 1e9)) : now_ns;
+  // system_time_stamp is captured before the blocking urg_get_distance*() call above, which
+  // blocks for ~one scan period waiting on the next scan. So now_ns is already ~one rotation
+  // stale by the time we get here, i.e. it already approximates "start of the scan we just
+  // received." Subtracting scan_period_ again here double-counted that rotation and made the
+  // GPIO pulse search target the *previous* scan's edge instead of the current one -- this was
+  // the source of the ~25ms (one rotation period) systematic early bias in PIN-sourced stamps.
+  uint64_t approx_scan_start_ns = now_ns;
 
   uint64_t matched_pulse_ns = 0;
   bool is_using_pin = use_gpio_timestamp_ && get_matching_pulse_timestamp(approx_scan_start_ns, matched_pulse_ns);
@@ -608,6 +614,7 @@ bool UrgNode2::create_scan_message(sensor_msgs::msg::LaserScan & msg)
     msg.header.stamp = system_time_stamp + system_latency_ + user_latency_ +
       get_angular_time_offset();
   }
+  msg.header.stamp = clamp_monotonic_stamp(rclcpp::Time(msg.header.stamp, RCL_SYSTEM_TIME));
 
   // データ領域確保
   msg.ranges.resize(num_beams);
@@ -657,8 +664,13 @@ bool UrgNode2::create_scan_message(sensor_msgs::msg::MultiEchoLaserScan & msg)
 
   // タイムスタンプ設定
   uint64_t now_ns = static_cast<uint64_t>(system_time_stamp.nanoseconds());
-  uint64_t approx_scan_start_ns = (now_ns > static_cast<uint64_t>(scan_period_ * 1e9)) ?
-    (now_ns - static_cast<uint64_t>(scan_period_ * 1e9)) : now_ns;
+  // system_time_stamp is captured before the blocking urg_get_distance*() call above, which
+  // blocks for ~one scan period waiting on the next scan. So now_ns is already ~one rotation
+  // stale by the time we get here, i.e. it already approximates "start of the scan we just
+  // received." Subtracting scan_period_ again here double-counted that rotation and made the
+  // GPIO pulse search target the *previous* scan's edge instead of the current one -- this was
+  // the source of the ~25ms (one rotation period) systematic early bias in PIN-sourced stamps.
+  uint64_t approx_scan_start_ns = now_ns;
 
   uint64_t matched_pulse_ns = 0;
   bool is_using_pin = use_gpio_timestamp_ && get_matching_pulse_timestamp(approx_scan_start_ns, matched_pulse_ns);
@@ -673,6 +685,7 @@ bool UrgNode2::create_scan_message(sensor_msgs::msg::MultiEchoLaserScan & msg)
     msg.header.stamp = system_time_stamp + system_latency_ + user_latency_ +
       get_angular_time_offset();
   }
+  msg.header.stamp = clamp_monotonic_stamp(rclcpp::Time(msg.header.stamp, RCL_SYSTEM_TIME));
 
   // データ領域確保
   msg.ranges.reserve(num_beams);
@@ -1210,6 +1223,21 @@ void UrgNode2::update_timestamp_source_log(bool is_using_pin)
       RCLCPP_INFO(get_logger(), "Getting timestamp from NETWORK (System / Network time)");
     }
   }
+}
+
+rclcpp::Time UrgNode2::clamp_monotonic_stamp(const rclcpp::Time & stamp_in)
+{
+  static constexpr int64_t kMinStepNs = 1000;  // 1 us
+  rclcpp::Time stamp = stamp_in;
+  if (last_stamp_.nanoseconds() != 0 && stamp <= last_stamp_) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 1000,
+      "Non-monotonic scan stamp (%.2f ms backwards); clamping.",
+      (last_stamp_ - stamp).seconds() * 1e3);
+    stamp = last_stamp_ + rclcpp::Duration(0, kMinStepNs);
+  }
+  last_stamp_ = stamp;
+  return stamp;
 }
 
 }  // namespace urg_node2
